@@ -1,8 +1,13 @@
+use std::collections::HashMap;
 use std::error::Error;
+use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::RwLock;
 
+// Define a convenient type alias for our shared thread-safe database
+type Db = Arc<RwLock<HashMap<String, String>>>;
 
 #[derive(Debug, PartialEq)]
 enum Command {
@@ -69,20 +74,24 @@ impl Command {
 async fn main() -> Result<(), Box<dyn Error>> {
   let addr = "127.0.0.1:8765";
   // let addr = "localhost:8765";
-  let listener = TcpListener::bind(addr).await?;
+  let listener: TcpListener = TcpListener::bind(addr).await?;
 
-  println!("Server listening on {}", addr);
+  println!("Server listening on: {}", addr);
+
+  // Initialize our shared in-memory database
+  let db: Db = Arc::new(RwLock::new(HashMap::new()));
 
   loop {
-    print!("> ");
-    
     // Accept incoming TCP connections
     let (socket, client_addr) = listener.accept().await?;
     println!("New client connected: {}", client_addr);
 
+    // Clone the arc pointer for this specific client task
+    let db_clone: Arc<RwLock<HashMap<String, String>>> = Arc::clone(&db);
+
     // Spawn a new task for each client connection
     tokio::spawn(async move {
-      if let Err(e) = handle_client(socket).await {
+      if let Err(e) = handle_client(socket, db_clone).await {
         eprintln!("Error handling client {}: {:?}", client_addr, e);
       }
 
@@ -91,26 +100,43 @@ async fn main() -> Result<(), Box<dyn Error>> {
   }
 }
 
-async fn handle_client(mut socket: TcpStream) -> Result<(), Box<dyn Error>> {
+async fn handle_client(mut socket: TcpStream, db: Db) -> Result<(), Box<dyn Error>> {
   let (reader, mut writer) = socket.split();
   let mut buf_reader = BufReader::new(reader);
   let mut line = String::new();
 
   // Read lines until client disconnects
   while buf_reader.read_line(&mut line).await? > 0 {
-    let response = match Command::from_line(&line) {
+    let response: String = match Command::from_line(&line) {
       Ok(cmd) => match cmd {
         Command::Ping => "+PONG\r\n".to_string(),
+
         Command::Set { key, val } => {
-          format!("+OK (parsed SET key='{}' val='{}')\r\n", key, val)
+          // Acquire exclusive write lock
+          let mut store = db.write().await;
+          store.insert(key, val);
+
+          "+OK\r\n".to_string()
         },
+
         Command::Get { key } => {
-          format!("+OK (parsed GET key='{}')\r\n", key)
+          // Acquire shared read lock
+          let store = db.read().await;
+
+          match store.get(&key) {
+            Some(val) => format!("{}\r\n{}\r\r", val.len(), val),
+            None => "$-1\r\n".to_string(),
+          }
         },
+
         Command::Del { key } => {
-          format!("+OK (parsed DEL key='{}')\r\n", key)
+          // Acquire exclusive write lock
+          let mut store = db.write().await;
+          let deleted_count = if store.remove(&key).is_some() { 1 } else { 0 };
+
+          format!(":{}\r\n", deleted_count)
         },
-      }
+      },
 
       Err(err) => format!("-ERR {}\r\n", err),
     };
