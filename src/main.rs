@@ -132,9 +132,12 @@ async fn handle_client(mut socket: TcpStream, db: Db) -> Result<(), Box<dyn Erro
         Command::Del { key } => {
           // Acquire exclusive write lock
           let mut store = db.write().await;
-          let deleted_count = if store.remove(&key).is_some() { 1 } else { 0 };
+          let deleted = store.remove(&key);
 
-          format!(":{}\r\n", deleted_count)
+          match deleted {
+              Some(_) => ":1\r\n".to_string(),
+              None => ":0\r\n".to_string(),
+          }
         },
       },
 
